@@ -26,6 +26,7 @@ type BuildRequest struct {
 	Method      string
 	Writer      io.Writer
 	CallbackUrl string
+	ScriptsUrl  string
 }
 
 type BuildResult STIResult
@@ -134,8 +135,27 @@ exec su {{.User}} -s /bin/bash -c /usr/bin/save-artifacts
 // Script used to initialize permissions on bind-mounts for a docker-run build (prepare call)
 var buildTemplate = template.Must(template.New("build-init.sh").Parse(`#!/bin/bash
 chown -R {{.User}}:{{.User}} /tmp/src && chmod -R 755 /tmp/src
+chown -R {{.User}}:{{.User}} /tmp/scripts && chmod -R 755 /tmp/scripts
 {{if .Incremental}}chown -R {{.User}}:{{.User}} /tmp/artifacts && chmod -R 755 /tmp/artifacts{{end}}
-exec su {{.User}} -s /bin/bash -c /usr/bin/prepare
+mkdir -p /opt/sti/bin
+if [ -f /tmp/src/.sti/scripts/run ]; then
+	# run script supplied in user source
+	cp /tmp/src/.sti/scripts/run /opt/sti/bin
+elif [ -f /tmp/scripts/run ]; then
+	# run script supplied on command line via url
+	cp /tmp/scripts/run /opt/sti/bin
+fi
+
+if [ -f /tmp/src/.sti/scripts/assemble ]; then
+	# assemble script supplied in user src
+	exec su {{.User}} -s /bin/bash -c /tmp/src/.sti/scripts/assemble
+elif [ -f /tmp/scripts/assemble ]; then
+	# assemble script supplied on command line via url
+	exec su {{.User}} -s /bin/bash -c /tmp/scripts/assemble
+else 
+  echo "No assemble script supplied in application source or via ScriptsUrl argument."
+fi
+	
 `))
 
 var dockerFileTemplate = template.Must(template.New("Dockerfile").Parse(`
@@ -198,6 +218,17 @@ func (h requestHandler) build(req BuildRequest, incremental bool) (*BuildResult,
 		return nil, err
 	}
 
+	targetScriptsDir := filepath.Join(req.WorkingDir, "scripts")
+	if req.ScriptsUrl != "" {
+		err = h.downloadScripts(req.ScriptsUrl, targetScriptsDir, "assemble")
+		if err != nil {
+			return nil, err
+		}
+		err = h.downloadScripts(req.ScriptsUrl, targetScriptsDir, "run")
+		if err != nil {
+			return nil, err
+		}
+	}
 	return h.buildDeployableImage(req, req.BaseImage, req.WorkingDir, incremental)
 }
 
@@ -345,6 +376,28 @@ func (h requestHandler) prepareSourceDir(source, targetSourceDir, ref string) er
 	return nil
 }
 
+func (h requestHandler) downloadScripts(url, targetDir, targetFile string) error {
+	log.Printf("Downloading file %s from url %s to directory %s\n", targetFile, url, targetDir)
+	os.MkdirAll(targetDir, 0777)
+	var err error
+	resp, err := http.Get(url + "/" + targetFile)
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
+		out, err := os.Create(targetDir + "/" + targetFile)
+		defer out.Close()
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(out, resp.Body)
+	} else {
+		//return fmt.Errorf("Failed to retrieve %s from %s, response code %d", targetFile, targetDir, resp.StatusCode)
+		log.Printf("Failed to retrieve %s from %s, response code %d", targetFile, targetDir, resp.StatusCode)
+	}
+	log.Printf("Done, error=%s\n", err)
+
+	return err
+}
+
 func (h requestHandler) buildDeployableImage(req BuildRequest, image string, contextDir string, incremental bool) (*BuildResult, error) {
 	if req.Method == "run" {
 		return h.buildDeployableImageWithDockerRun(req, image, contextDir, incremental)
@@ -425,10 +478,21 @@ func (h requestHandler) buildDeployableImageWithDockerBuild(req BuildRequest, im
 }
 
 func (h requestHandler) buildDeployableImageWithDockerRun(req BuildRequest, image string, contextDir string, incremental bool) (*BuildResult, error) {
+	log.Printf("Building with docker run invocation\n")
 	volumeMap := make(map[string]struct{})
 	volumeMap["/tmp/src"] = struct{}{}
+	volumeMap["/tmp/scripts"] = struct{}{}
 	if incremental {
 		volumeMap["/tmp/artifacts"] = struct{}{}
+	}
+
+	// if the invoker provided a run script, set that as the new run cmd for the output
+	// image, otherwise leave the run command alone.
+	overrideRun := false
+	if _, err := os.Stat(filepath.Join(contextDir, "scripts", "run")); err == nil {
+		overrideRun = true
+	} else if _, err := os.Stat(filepath.Join(contextDir, "src", ".sti", "scripts", "run")); err == nil {
+		overrideRun = true
 	}
 
 	imageMetadata, err := h.dockerClient.InspectImage(image)
@@ -441,10 +505,13 @@ func (h requestHandler) buildDeployableImageWithDockerRun(req BuildRequest, imag
 		return nil, err
 	}
 
+	origCmd := imageMetadata.Config.Cmd
+	origEntrypoint := imageMetadata.Config.Entrypoint
 	user := imageMetadata.ContainerConfig.User
 	hasUser := (user != "")
 
-	cmd := []string{"/usr/bin/prepare"}
+	//cmd := []string{"/usr/bin/prepare"}
+	cmd := []string{"/tmp/scripts/assemble"}
 	if hasUser {
 		cmd = []string{"/.container.init/init.sh"}
 		volumeMap["/.container.init"] = struct{}{}
@@ -471,6 +538,7 @@ func (h requestHandler) buildDeployableImageWithDockerRun(req BuildRequest, imag
 	binds := []string{
 		filepath.Join(contextDir, "src") + ":/tmp/src",
 	}
+	binds = append(binds, filepath.Join(contextDir, "scripts")+":/tmp/scripts")
 	if incremental {
 		binds = append(binds, filepath.Join(contextDir, "artifacts")+":/tmp/artifacts")
 	}
@@ -488,9 +556,10 @@ func (h requestHandler) buildDeployableImageWithDockerRun(req BuildRequest, imag
 		}
 
 		templateFiller := struct {
-			User        string
-			Incremental bool
-		}{user, incremental}
+			User          string
+			Incremental   bool
+			RemoteScripts bool
+		}{user, incremental, req.ScriptsUrl != ""}
 
 		err = buildTemplate.Execute(buildScript, templateFiller)
 		if err != nil {
@@ -527,7 +596,13 @@ func (h requestHandler) buildDeployableImageWithDockerRun(req BuildRequest, imag
 		return nil, ErrBuildFailed
 	}
 
-	config = docker.Config{Image: image, Cmd: []string{"/usr/bin/run"}, Env: cmdEnv}
+	//config = docker.Config{Image: image, Cmd: []string{"/usr/bin/run"}, Env: cmdEnv}
+	log.Printf("Override run is %t", overrideRun)
+	if overrideRun {
+		config = docker.Config{Image: image, Cmd: []string{"/opt/sti/bin/run"}, Env: cmdEnv}
+	} else {
+		config = docker.Config{Image: image, Cmd: origCmd, Entrypoint: origEntrypoint, Env: cmdEnv}
+	}
 	if hasUser {
 		config.User = user
 	}

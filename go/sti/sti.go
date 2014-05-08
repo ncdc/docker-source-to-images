@@ -104,6 +104,7 @@ func Execute() {
 	buildCmd.Flags().StringVarP(&(buildReq.Method), "method", "m", "run", "Specify a method to build with. build -> 'docker build', run -> 'docker run'")
 	buildCmd.Flags().StringVarP(&(buildReq.Ref), "ref", "r", "", "Specify a ref to check-out")
 	buildCmd.Flags().StringVar(&(buildReq.CallbackUrl), "callbackUrl", "", "Specify a URL to invoke via HTTP POST upon build completion")
+	buildCmd.Flags().StringVarP(&(buildReq.ScriptsUrl), "scripts", "s", "", "Specify a URL for the assemble and run scripts")
 
 	stiCmd.AddCommand(buildCmd)
 
