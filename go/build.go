@@ -129,7 +129,7 @@ func executeCallback(callbackUrl string, result *BuildResult) {
 // Script used to initialize permissions on bind-mounts when a non-root user is specified by an image
 var saveArtifactsInitTemplate = template.Must(template.New("sa-init.sh").Parse(`#!/bin/bash
 chown -R {{.User}}:{{.User}} /tmp/artifacts && chmod -R 755 /tmp/artifacts
-exec su {{.User}} -s /bin/bash -c /usr/bin/save-artifacts
+exec su {{.User}} -s /bin/bash -c /opt/sti/bin/save-artifacts
 `))
 
 // Script used to initialize permissions on bind-mounts for a docker-run build (prepare call)
@@ -138,24 +138,29 @@ chown -R {{.User}}:{{.User}} /tmp/src && chmod -R 755 /tmp/src
 chown -R {{.User}}:{{.User}} /tmp/scripts && chmod -R 755 /tmp/scripts
 {{if .Incremental}}chown -R {{.User}}:{{.User}} /tmp/artifacts && chmod -R 755 /tmp/artifacts{{end}}
 mkdir -p /opt/sti/bin
-if [ -f /tmp/src/.sti/scripts/run ]; then
-	# run script supplied in user source
-	cp /tmp/src/.sti/scripts/run /opt/sti/bin
-elif [ -f /tmp/scripts/run ]; then
-	# run script supplied on command line via url
-	cp /tmp/scripts/run /opt/sti/bin
+
+function copy_script() {
+	if [ -f /tmp/src/.sti/scripts/$1 ]; then
+		# script supplied in user source
+		cp /tmp/src/.sti/scripts/$1 /opt/sti/bin
+	elif [ -f /tmp/scripts/$1 ]; then
+		# script supplied on command line via url
+		cp /tmp/scripts/$1 /opt/sti/bin
+	fi
+}
+
+copy_script "run"
+copy_script "save-artifacts"
+copy_script "assemble"
+
+
+if [ -f /opt/sti/bin/assemble ]; then
+	exec su {{.User}} -s /bin/bash -c /opt/sti/bin/assemble
+else
+  echo "No assemble script supplied in application source or via ScriptsUrl argument."
+  exit 1
 fi
 
-if [ -f /tmp/src/.sti/scripts/assemble ]; then
-	# assemble script supplied in user src
-	exec su {{.User}} -s /bin/bash -c /tmp/src/.sti/scripts/assemble
-elif [ -f /tmp/scripts/assemble ]; then
-	# assemble script supplied on command line via url
-	exec su {{.User}} -s /bin/bash -c /tmp/scripts/assemble
-else 
-  echo "No assemble script supplied in application source or via ScriptsUrl argument."
-fi
-	
 `))
 
 var dockerFileTemplate = template.Must(template.New("Dockerfile").Parse(`
@@ -184,7 +189,7 @@ func (h requestHandler) detectIncrementalBuild(tag string) (bool, error) {
 	}
 	defer h.removeContainer(container.ID)
 
-	return FileExistsInContainer(h.dockerClient, container.ID, "/usr/bin/save-artifacts"), nil
+	return FileExistsInContainer(h.dockerClient, container.ID, "/opt/sti/bin/save-artifacts"), nil
 }
 
 func (h requestHandler) build(req BuildRequest, incremental bool) (*BuildResult, error) {
@@ -228,6 +233,10 @@ func (h requestHandler) build(req BuildRequest, incremental bool) (*BuildResult,
 		if err != nil {
 			return nil, err
 		}
+		err = h.downloadScripts(req.ScriptsUrl, targetScriptsDir, "save-artifacts")
+		if err != nil {
+			return nil, err
+		}
 	}
 	return h.buildDeployableImage(req, req.BaseImage, req.WorkingDir, incremental)
 }
@@ -247,7 +256,7 @@ func (h requestHandler) saveArtifacts(image string, tmpDir string, path string) 
 
 	volumeMap := make(map[string]struct{})
 	volumeMap["/tmp/artifacts"] = struct{}{}
-	cmd := []string{"/usr/bin/save-artifacts"}
+	cmd := []string{"/opt/sti/bin/save-artifacts"}
 
 	if hasUser {
 		volumeMap["/.container.init"] = struct{}{}
